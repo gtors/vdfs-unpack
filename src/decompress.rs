@@ -160,23 +160,41 @@ pub fn decompress_file(
     let ctype = detect_compr_type(&descr.magic)
         .context("unknown compression type in descriptor")?;
 
-    // Samsung-specific "hZip"/"hGzp"/... descriptor: the reference tool
-    // rejects these (magic[0] must be 'C' or 'I') and their extent table is
-    // not in the reference layout. Empirically the whole region before the
-    // descriptor is a single compression stream yielding the full file
-    // (its decompressed length matches the descriptor's unpacked_size).
-    if descr.magic[0] == b'h' {
-        let region = &data[..descr_offset];
-        return decompress_with(region, ctype)
-            .with_context(|| format!("hZip single-stream inflate (len={})", region.len()));
-    }
-
     let comp_extents_count = descr.extents_num as usize;
     let extent_struct_size = std::mem::size_of::<Vdfs4CompExtent>();
 
+    // Authenticated compressed files place a digest for every extent plus
+    // one file digest, followed by an optional RSA signature, between the
+    // extent table and the descriptor. The descriptor's first magic byte
+    // selects the digest algorithm: C=none, I=MD5, H=SHA-1, h=SHA-256.
+    let digest_size = match descr.magic[0] {
+        b'C' => 0usize,
+        b'I' => 16,
+        b'H' => 20,
+        b'h' => 32,
+        other => bail!("Unknown compressed-file authentication type: 0x{other:02x}"),
+    };
+    let signature_size = match descr.sign_type {
+        0 => 0usize,
+        1 => 128,
+        2 => 256,
+        other => bail!("Unknown compressed-file signature type: {other}"),
+    };
+    let auth_size = comp_extents_count
+        .checked_add(1)
+        .and_then(|count| count.checked_mul(digest_size))
+        .and_then(|size| size.checked_add(signature_size))
+        .context("compressed-file authentication table size overflow")?;
+
     // The compressed chunks live at the front of the blob; the comp_extent
-    // table is contiguous immediately *before* the descriptor (at the tail).
-    let table_offset = descr_offset.saturating_sub(comp_extents_count * extent_struct_size);
+    // table is followed by the optional authentication table and descriptor.
+    let table_size = comp_extents_count
+        .checked_mul(extent_struct_size)
+        .context("compressed extent table size overflow")?;
+    let table_offset = descr_offset
+        .checked_sub(auth_size)
+        .and_then(|offset| offset.checked_sub(table_size))
+        .context("compressed extent table lies outside the file data")?;
 
     // Decompress every chunk and concatenate. The reference tool does not
     // trust unpacked_size for sizing -- it simply writes each chunk's full
@@ -206,6 +224,15 @@ pub fn decompress_file(
                 .with_context(|| format!("decompressing chunk #{} (start={} len={})", read, start, chunk_len))?;
             result.extend_from_slice(&decompressed);
         }
+    }
+
+    let expected_size = descr.unpacked_size as usize;
+    if result.len() != expected_size {
+        bail!(
+            "decompressed size mismatch: expected {} bytes, got {}",
+            expected_size,
+            result.len()
+        );
     }
 
     Ok(result)
