@@ -165,7 +165,55 @@ pub fn decompress_file(
     // not in the reference layout. Empirically the whole region before the
     // descriptor is a single compression stream yielding the full file
     // (its decompressed length matches the descriptor's unpacked_size).
+    // "hZip" descriptors carry SHA-256 authentication (magic[0] == 'h').
+    // Layout, per the reference implementation (lib/decompress.c):
+    //   [data area][extent table][hashes][signature][descriptor]
+    // The extent table is located by subtracting its size plus the hash and
+    // signature lengths from the end. Each extent is {magic:u16, flags:u16,
+    // len_bytes:u32, start:u64}; `flags` non-zero means the chunk is stored
+    // uncompressed. Table order is the logical chunk order, not offset order.
     if descr.magic[0] == b'h' {
+        let ext_n = { descr.extents_num } as usize;
+        let sign_len = match { descr.sign_type } {
+            1 => 128, // VDFS4_SIGN_RSA1024
+            2 => 256, // VDFS4_SIGN_RSA2048
+            _ => 0,
+        };
+        let hash_len = 32; // SHA-256
+        let tail = VDFS4_COMPR_FILE_DESC_LEN_06 + ext_n * 16 + hash_len * (ext_n + 1) + sign_len;
+        if data.len() >= tail {
+            let table = data.len() - tail;
+            if table + ext_n * 16 <= descr_offset {
+                let mut out = Vec::with_capacity({ descr.unpacked_size } as usize);
+                let mut complete = true;
+                for i in 0..ext_n {
+                    let e = &data[table + i * 16..table + (i + 1) * 16];
+                    let flags = u16::from_le_bytes([e[2], e[3]]);
+                    let len = u32::from_le_bytes([e[4], e[5], e[6], e[7]]) as usize;
+                    let start = u64::from_le_bytes(e[8..16].try_into().unwrap()) as usize;
+                    let chunk = match start.checked_add(len).and_then(|end| data.get(start..end)) {
+                        Some(chunk) if len > 0 => chunk,
+                        _ => {
+                            complete = false;
+                            break;
+                        }
+                    };
+                    if flags != 0 {
+                        out.extend_from_slice(chunk);
+                    } else if let Ok(dec) = decompress_with(chunk, ctype) {
+                        out.extend_from_slice(&dec);
+                    } else {
+                        complete = false;
+                        break;
+                    }
+                }
+                if complete {
+                    return Ok(out);
+                }
+            }
+        }
+        // No usable extent table: the whole region before the descriptor as
+        // one stream (the layout seen on earlier images).
         let region = &data[..descr_offset];
         return decompress_with(region, ctype)
             .with_context(|| format!("hZip single-stream inflate (len={})", region.len()));
